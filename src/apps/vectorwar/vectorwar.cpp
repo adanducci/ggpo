@@ -7,6 +7,7 @@
 #include "vectorwar.h"
 #include "ggpo_perfmon.h"
 
+//#define FORCE_ALL_INPUTS    // test: flip every input every frame
 //#define SYNC_TEST    // test: turn on synctest
 #define MAX_PLAYERS     64
 
@@ -408,6 +409,9 @@ VectorWar_RunFrame(HWND hwnd)
      int input = ReadInputs(hwnd);
 #if defined(SYNC_TEST)
      input = rand(); // test: use random inputs to demonstrate sync testing
+#endif
+#if defined(FORCE_ALL_INPUTS)
+     input = ngs.now.framenumber % 2 == 0 ? 0x00000000 : 0xffffffff;
 #endif
      result = ggpo_add_local_input(ggpo, ngs.local_player_handle, &input, sizeof(input));
   }

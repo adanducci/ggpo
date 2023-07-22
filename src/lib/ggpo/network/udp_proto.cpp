@@ -114,6 +114,7 @@ UdpProtocol::SendPendingOutput()
    int i, j, offset = 0;
    uint8 *bits;
    GameInput last;
+   const int deltaInputSize = 2 + BITVECTOR_NIBBLE_SIZE;
 
    if (_pending_output.size()) {
       last = _last_acked_input;
@@ -125,18 +126,46 @@ UdpProtocol::SendPendingOutput()
       ASSERT(last.frame == -1 || last.frame + 1 == msg->u.input.start_frame);
       for (j = 0; j < _pending_output.size(); j++) {
          GameInput &current = _pending_output.item(j);
+         int frame_start_offset = offset;
+         int deltaSuccess = 1;
+         // Optimistically set the first bit, then attempt to compress
+         // the input with delta encoding. If the memory used by the
+         // delta compression ever exceeds the size of the inputs,
+         // bail out.
+         BitVector_SetBit(msg->u.input.bits, &offset);
          if (memcmp(current.bits, last.bits, current.size) != 0) {
-            ASSERT((GAMEINPUT_MAX_BYTES * GAMEINPUT_MAX_PLAYERS * 8) < (1 << BITVECTOR_NIBBLE_SIZE));
-            for (i = 0; i < current.size * 8; i++) {
-               ASSERT(i < (1 << BITVECTOR_NIBBLE_SIZE));
-               if (current.value(i) != last.value(i)) {
-                  BitVector_SetBit(msg->u.input.bits, &offset);
-                  (current.value(i) ? BitVector_SetBit : BitVector_ClearBit)(bits, &offset);
-                  BitVector_WriteNibblet(bits, i, &offset);
-               }
-            }
+             ASSERT((GAMEINPUT_MAX_BYTES * GAMEINPUT_MAX_PLAYERS * 8) < (1 << BITVECTOR_NIBBLE_SIZE));
+             for (i = 0; i < current.size * 8; i++) {
+                 ASSERT(i < (1 << BITVECTOR_NIBBLE_SIZE));
+                 if (current.value(i) != last.value(i)) {
+                     if ((offset - frame_start_offset) + deltaInputSize > current.size * 8) {
+                         deltaSuccess = 0;
+                         break;
+                     }
+
+                     int before_delta_offset = offset;
+                     BitVector_SetBit(msg->u.input.bits, &offset);
+                     (current.value(i) ? BitVector_SetBit : BitVector_ClearBit)(bits, &offset);
+                     BitVector_WriteNibblet(bits, i, &offset);
+                     ASSERT(before_delta_offset + deltaInputSize == offset);
+                 }
+             }
          }
-         BitVector_ClearBit(msg->u.input.bits, &offset);
+
+         if (deltaSuccess) {
+             BitVector_ClearBit(msg->u.input.bits, &offset);
+         } else {
+             // We'd send more using the delta encoding than we would
+             // just copying all the input bytes directly.
+             //
+             // Rewind the offset to frame start, write a zero for
+             // no-delta, then copy over all the inputs.
+             offset = frame_start_offset;
+             BitVector_ClearBit(msg->u.input.bits, &offset);
+             for (i = 0; i < current.size * 8; i++) {
+                 (current.value(i) ? BitVector_SetBit : BitVector_ClearBit)(bits, &offset);
+             }
+         }
          last = _last_sent_input = current;
       }
    } else {
@@ -560,17 +589,38 @@ UdpProtocol::OnInput(UdpMsg *msg, int len)
           */
          ASSERT(currentFrame <= (_last_received_input.frame + 1));
          bool useInputs = currentFrame == _last_received_input.frame + 1;
-
-         while (BitVector_ReadBit(bits, &offset)) {
-            int on = BitVector_ReadBit(bits, &offset);
-            int button = BitVector_ReadNibblet(bits, &offset);
-            if (useInputs) {
-               if (on) {
-                  _last_received_input.set(button);
-               } else {
-                  _last_received_input.clear(button);
-               }
-            }
+         int isDelta = BitVector_ReadBit(bits, &offset);
+         if (isDelta) {
+             while (BitVector_ReadBit(bits, &offset)) {
+                int on = BitVector_ReadBit(bits, &offset);
+                int button = BitVector_ReadNibblet(bits, &offset);
+                if (useInputs) {
+                    if (on) {
+                        _last_received_input.set(button);
+                    }
+                    else {
+                        _last_received_input.clear(button);
+                    }
+                }
+             }
+         } else {
+             if (useInputs) {
+                 int i;
+                 // memcpy is a bear to use here thanks to unaligned
+                 // bits- be inefficient but legible.
+                 for (i = 0; i < _last_received_input.size * 8; i++) {
+                     if (BitVector_ReadBit(bits, &offset)) {
+                         _last_received_input.set(i);
+                     }
+                     else {
+                         _last_received_input.clear(i);
+                     }
+                 }
+             }
+             else {
+                 // Seek the offset past all of this data.
+                 offset += _last_received_input.size * 8;
+             }
          }
          ASSERT(offset <= numBits);
 
